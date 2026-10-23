@@ -1,0 +1,312 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Criar projeto
+        run: |
+          mkdir -p "$(dirname settings.gradle.kts)"
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "NfcSalvar"
+          include(":app")
+          EOF
+          mkdir -p "$(dirname build.gradle.kts)"
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          mkdir -p "$(dirname gradle.properties)"
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+          mkdir -p "$(dirname app/build.gradle.kts)"
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.exemplo.nfcsalvar"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.exemplo.nfcsalvar"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          mkdir -p "$(dirname app/src/main/AndroidManifest.xml)"
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.NFC" />
+              <uses-feature android:name="android.hardware.nfc" android:required="true" />
+              <uses-feature android:name="android.hardware.nfc.hce" android:required="true" />
+              <application
+                  android:label="@string/app_name"
+                  android:allowBackup="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".NdefService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_NFC_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.nfc.cardemulation.action.HOST_APDU_SERVICE" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.nfc.cardemulation.host_apdu_service"
+                          android:resource="@xml/apduservice" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p "$(dirname app/src/main/res/values/strings.xml)"
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources><string name="app_name">NFC Salvar</string></resources>
+          EOF
+          mkdir -p "$(dirname app/src/main/res/xml/apduservice.xml)"
+          cat > app/src/main/res/xml/apduservice.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <host-apdu-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/app_name"
+              android:requireDeviceUnlock="false">
+              <aid-group android:description="@string/app_name" android:category="other">
+                  <aid-filter android:name="D2760000850101" />
+              </aid-group>
+          </host-apdu-service>
+          EOF
+          mkdir -p "$(dirname app/src/main/java/com/exemplo/nfcsalvar/Store.kt)"
+          cat > app/src/main/java/com/exemplo/nfcsalvar/Store.kt <<'EOF'
+          package com.exemplo.nfcsalvar
+
+          import android.content.Context
+          import org.json.JSONObject
+
+          object Store {
+              private fun p(c: Context) = c.getSharedPreferences("tags", Context.MODE_PRIVATE)
+              private fun obj(c: Context) = JSONObject(p(c).getString("data", "{}") ?: "{}")
+
+              fun all(c: Context): LinkedHashMap<String, String> {
+                  val o = obj(c)
+                  val m = LinkedHashMap<String, String>()
+                  o.keys().forEach { m[it] = o.getString(it) }
+                  return m
+              }
+
+              fun save(c: Context, name: String, bytes: ByteArray) {
+                  val o = obj(c)
+                  o.put(name, bytes.joinToString("") { "%02X".format(it) })
+                  p(c).edit().putString("data", o.toString()).commit()
+              }
+
+              fun delete(c: Context, name: String) {
+                  val o = obj(c)
+                  o.remove(name)
+                  p(c).edit().putString("data", o.toString()).commit()
+                  if (active(c) == name) setActive(c, null)
+              }
+
+              fun active(c: Context): String? = p(c).getString("active", null)
+              fun setActive(c: Context, n: String?) { p(c).edit().putString("active", n).commit() }
+
+              fun activeBytes(c: Context): ByteArray? {
+                  val h = all(c)[active(c) ?: return null] ?: return null
+                  return ByteArray(h.length / 2) { h.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+              }
+          }
+          EOF
+          mkdir -p "$(dirname app/src/main/java/com/exemplo/nfcsalvar/NdefService.kt)"
+          cat > app/src/main/java/com/exemplo/nfcsalvar/NdefService.kt <<'EOF'
+          package com.exemplo.nfcsalvar
+
+          import android.nfc.cardemulation.HostApduService
+          import android.os.Bundle
+
+          // Emula uma tag NFC Type 4 contendo a mensagem NDEF da tag ativa.
+          class NdefService : HostApduService() {
+              private var selected = 0 // 1 = CC, 2 = NDEF
+
+              companion object {
+                  val AID = byteArrayOf(0xD2.toByte(), 0x76, 0x00, 0x00, 0x85.toByte(), 0x01, 0x01)
+                  val OK = byteArrayOf(0x90.toByte(), 0x00)
+                  val NOT_FOUND = byteArrayOf(0x6A, 0x82.toByte())
+                  val ERR = byteArrayOf(0x6F, 0x00)
+                  val CC = byteArrayOf(
+                      0x00, 0x0F, 0x20, 0x00, 0x3B, 0x00, 0x34,
+                      0x04, 0x06, 0xE1.toByte(), 0x04, 0x7F, 0xFF.toByte(), 0x00, 0xFF.toByte()
+                  )
+              }
+
+              private fun u(b: Byte) = b.toInt() and 0xFF
+
+              private fun ndefFile(): ByteArray {
+                  val m = Store.activeBytes(this) ?: ByteArray(0)
+                  return byteArrayOf((m.size shr 8).toByte(), (m.size and 0xFF).toByte()) + m
+              }
+
+              override fun processCommandApdu(c: ByteArray, extras: Bundle?): ByteArray {
+                  try {
+                      if (c.size < 4) return ERR
+                      when (u(c[1])) {
+                          0xA4 -> {
+                              if (u(c[2]) == 0x04) {
+                                  val n = u(c[4])
+                                  if (c.size < 5 + n) return ERR
+                                  return if (c.copyOfRange(5, 5 + n).contentEquals(AID)) OK else NOT_FOUND
+                              }
+                              val id = (u(c[5]) shl 8) or u(c[6])
+                              selected = when (id) { 0xE103 -> 1; 0xE104 -> 2; else -> 0 }
+                              return if (selected != 0) OK else NOT_FOUND
+                          }
+                          0xB0 -> {
+                              val off = (u(c[2]) shl 8) or u(c[3])
+                              val le = if (c.size > 4 && u(c[4]) != 0) u(c[4]) else 256
+                              val data = when (selected) { 1 -> CC; 2 -> ndefFile(); else -> return NOT_FOUND }
+                              if (off > data.size) return ERR
+                              return data.copyOfRange(off, minOf(data.size, off + le)) + OK
+                          }
+                      }
+                  } catch (e: Exception) { }
+                  return ERR
+              }
+
+              override fun onDeactivated(reason: Int) { selected = 0 }
+          }
+          EOF
+          mkdir -p "$(dirname app/src/main/java/com/exemplo/nfcsalvar/MainActivity.kt)"
+          cat > app/src/main/java/com/exemplo/nfcsalvar/MainActivity.kt <<'EOF'
+          package com.exemplo.nfcsalvar
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.graphics.Typeface
+          import android.nfc.NfcAdapter
+          import android.nfc.Tag
+          import android.nfc.tech.Ndef
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private lateinit var list: LinearLayout
+              private lateinit var status: TextView
+              private var nfc: NfcAdapter? = null
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  nfc = NfcAdapter.getDefaultAdapter(this)
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 64, 32, 32) }
+                  val read = Button(this).apply { text = "Ler nova tag"; setOnClickListener { startRead() } }
+                  status = TextView(this).apply { textSize = 16f; setPadding(0, 24, 0, 24) }
+                  list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  root.addView(read)
+                  root.addView(status)
+                  root.addView(ScrollView(this).apply { addView(list) })
+                  setContentView(root)
+                  refresh()
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  try { nfc?.disableReaderMode(this) } catch (e: Exception) { }
+              }
+
+              private fun startRead() {
+                  val n = nfc
+                  if (n == null || !n.isEnabled) { Toast.makeText(this, "Ative o NFC nas configurações", Toast.LENGTH_LONG).show(); return }
+                  status.text = "Aproxime a tag do celular..."
+                  n.enableReaderMode(
+                      this,
+                      NfcAdapter.ReaderCallback { tag -> onTag(tag) },
+                      NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_NFC_B or
+                          NfcAdapter.FLAG_READER_NFC_F or NfcAdapter.FLAG_READER_NFC_V,
+                      null
+                  )
+              }
+
+              private fun onTag(tag: Tag) {
+                  val ndef = Ndef.get(tag)
+                  var msg: ByteArray? = null
+                  try {
+                      ndef?.connect()
+                      msg = (ndef?.ndefMessage ?: ndef?.cachedNdefMessage)?.toByteArray()
+                  } catch (e: Exception) {
+                  } finally {
+                      try { ndef?.close() } catch (e: Exception) { }
+                  }
+                  runOnUiThread {
+                      nfc?.disableReaderMode(this)
+                      if (msg == null) { status.text = "Não consegui ler dados NDEF dessa tag."; return@runOnUiThread }
+                      askName(msg)
+                  }
+              }
+
+              private fun askName(msg: ByteArray) {
+                  val et = EditText(this).apply { hint = "Nome (ex: Porta, Cartão 1)" }
+                  AlertDialog.Builder(this)
+                      .setTitle("Salvar tag (${msg.size} bytes)")
+                      .setView(et)
+                      .setPositiveButton("Salvar") { _, _ ->
+                          val name = et.text.toString().trim()
+                          if (name.isNotEmpty()) { Store.save(this, name, msg); refresh() }
+                      }
+                      .setNegativeButton("Cancelar") { _, _ -> refresh() }
+                      .show()
+              }
+
+              private fun refresh() {
+                  list.removeAllViews()
+                  val act = Store.active(this)
+                  status.text = if (act != null) "Emulando: $act\nAproxime o celular do leitor (tela ligada)." else "Nenhuma tag ativa."
+                  for ((name, hex) in Store.all(this)) {
+                      val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(0, 12, 0, 12) }
+                      val tv = TextView(this).apply {
+                          text = name + " (" + hex.length / 2 + " B)" + if (name == act) "  ✓" else ""
+                          textSize = 18f
+                          if (name == act) setTypeface(null, Typeface.BOLD)
+                          layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                      }
+                      val em = Button(this).apply { text = "Emular"; setOnClickListener { Store.setActive(this@MainActivity, name); refresh() } }
+                      val del = Button(this).apply { text = "X"; setOnClickListener { Store.delete(this@MainActivity, name); refresh() } }
+                      row.addView(tv); row.addView(em); row.addView(del)
+                      list.addView(row)
+                  }
+              }
+          }
+          EOF
+      - name: Compilar
+        run: gradle assembleDebug
+      - name: Publicar APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "apk-${{ github.run_number }}" app/build/outputs/apk/debug/app-debug.apk --repo "${{ github.repository }}" --title "NFC Salvar APK" --notes "Baixe o app-debug.apk"
